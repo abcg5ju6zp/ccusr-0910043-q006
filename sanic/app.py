@@ -536,6 +536,7 @@ class Sanic(
                 condition=signal.condition,
                 exclusive=signal.exclusive,
                 priority=signal.priority,
+                policy=signal.policy,
             )
 
     @overload

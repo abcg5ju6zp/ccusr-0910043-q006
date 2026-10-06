@@ -391,6 +391,7 @@ class Blueprint(BaseSanic):
                     future.condition,
                     False,
                     future.priority,
+                    future.policy,
                 )
             )
 

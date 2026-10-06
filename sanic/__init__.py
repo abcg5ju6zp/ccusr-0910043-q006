@@ -35,6 +35,12 @@ from sanic.response import (
     text,
 )
 from sanic.server.websockets.impl import WebsocketImplProtocol as Websocket
+from sanic.signal_policy import (
+    FailureMode,
+    SignalDispatchError,
+    SignalFailure,
+    SignalPolicy,
+)
 
 
 DefaultSanic: TypeAlias = "Sanic[Config, SimpleNamespace]"
@@ -75,6 +81,11 @@ __all__ = (
     "ServerError",
     "ServiceUnavailable",
     "Unauthorized",
+    # Signal subscriber policies
+    "FailureMode",
+    "SignalPolicy",
+    "SignalFailure",
+    "SignalDispatchError",
     # Common response methods
     "empty",
     "file",

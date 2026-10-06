@@ -1,6 +1,6 @@
 from collections.abc import Iterable
 from pathlib import Path
-from typing import Callable, NamedTuple
+from typing import Any, Callable, NamedTuple
 
 from sanic.handlers.directory import DirectoryHandler
 from sanic.models.handler_types import (
@@ -70,6 +70,7 @@ class FutureSignal(NamedTuple):
     condition: dict[str, str] | None
     exclusive: bool
     priority: int
+    policy: Any = None
 
 
 class FutureRegistry(set): ...
