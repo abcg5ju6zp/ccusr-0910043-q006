@@ -1,6 +1,8 @@
+from __future__ import annotations
+
 from collections.abc import Iterable
 from pathlib import Path
-from typing import Callable, NamedTuple
+from typing import TYPE_CHECKING, Callable, NamedTuple
 
 from sanic.handlers.directory import DirectoryHandler
 from sanic.models.handler_types import (
@@ -10,6 +12,10 @@ from sanic.models.handler_types import (
     SignalHandler,
 )
 from sanic.types import HashableDict
+
+
+if TYPE_CHECKING:
+    from sanic.signals import SignalPolicy
 
 
 class FutureRoute(NamedTuple):
@@ -70,6 +76,13 @@ class FutureSignal(NamedTuple):
     condition: dict[str, str] | None
     exclusive: bool
     priority: int
+    policy: SignalPolicy | None = None
+
+
+class FutureSignalCompensation(NamedTuple):
+    handler: SignalHandler
+    event: str
+    domain: str | None
 
 
 class FutureRegistry(set): ...

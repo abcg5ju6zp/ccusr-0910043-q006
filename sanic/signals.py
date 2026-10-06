@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from inspect import isawaitable
 from typing import Any, cast
@@ -87,6 +87,171 @@ class Signal(Route):
     """项目内部接口说明。"""
 
 
+class SignalFailureMode(Enum):
+    """订阅者抛出异常时,单次派发应当如何应对。"""
+
+    PROPAGATE = "propagate"
+    """立即失败:中断本次派发并把异常抛给派发方(旧式默认行为)。"""
+
+    ISOLATE = "isolate"
+    """隔离后继续:把失败限制在其故障域内,其余订阅者继续执行。"""
+
+    COMPENSATE = "compensate"
+    """执行已登记的补偿:先运行该事件登记的补偿处理器,再继续派发。"""
+
+
+class SignalCriticality(Enum):
+    """订阅者对于一次派发整体成败的关键级别。"""
+
+    CRITICAL = "critical"
+    NON_CRITICAL = "non_critical"
+
+
+@dataclass(frozen=True)
+class SignalPolicy:
+    """信号订阅者声明的执行顺序、关键级别、故障域与失败策略。
+
+    未声明任何策略字段的旧式订阅者不会得到 ``SignalPolicy``
+    (``signal.ctx.policy is None``),派发行为与历史版本完全一致。
+
+    ``order`` 越小越先执行;它与旧式 ``priority`` 共用同一排序通道
+    (``order = N`` 等价于 ``priority = -N``,而 ``priority``
+    大者先执行),因此两者混用时顺序依然可预期。
+    """
+
+    order: int = 0
+    criticality: SignalCriticality = SignalCriticality.CRITICAL
+    domain: str | None = None
+    on_failure: SignalFailureMode = SignalFailureMode.PROPAGATE
+
+    @classmethod
+    def build(
+        cls,
+        *,
+        order: int | None = None,
+        criticality: SignalCriticality | str | None = None,
+        domain: str | None = None,
+        on_failure: SignalFailureMode | str | None = None,
+    ) -> SignalPolicy | None:
+        """根据声明构建策略;什么都没声明时返回 ``None``(旧式行为)。"""
+        if (
+            order is None
+            and criticality is None
+            and domain is None
+            and on_failure is None
+        ):
+            return None
+
+        crit = cls._coerce_criticality(criticality)
+        mode = cls._coerce_mode(on_failure)
+        if mode is None:
+            # 非关键订阅者默认隔离失败,关键订阅者默认立即失败
+            mode = (
+                SignalFailureMode.ISOLATE
+                if crit is SignalCriticality.NON_CRITICAL
+                else SignalFailureMode.PROPAGATE
+            )
+        return cls(
+            order=order or 0,
+            criticality=crit,
+            domain=domain,
+            on_failure=mode,
+        )
+
+    @staticmethod
+    def _coerce_criticality(
+        value: SignalCriticality | str | None,
+    ) -> SignalCriticality:
+        if value is None:
+            return SignalCriticality.CRITICAL
+        if isinstance(value, SignalCriticality):
+            return value
+        try:
+            return SignalCriticality(str(value))
+        except ValueError:
+            raise InvalidSignal(
+                "Invalid signal criticality: %s. Must be one of: %s"
+                % (
+                    value,
+                    ", ".join(member.value for member in SignalCriticality),
+                )
+            ) from None
+
+    @staticmethod
+    def _coerce_mode(
+        value: SignalFailureMode | str | None,
+    ) -> SignalFailureMode | None:
+        if value is None or isinstance(value, SignalFailureMode):
+            return value
+        try:
+            return SignalFailureMode(str(value))
+        except ValueError:
+            raise InvalidSignal(
+                "Invalid signal failure mode: %s. Must be one of: %s"
+                % (
+                    value,
+                    ", ".join(member.value for member in SignalFailureMode),
+                )
+            ) from None
+
+
+@dataclass(frozen=True)
+class SignalCompensation:
+    """针对某个事件(可选地限定故障域)登记的补偿处理器。"""
+
+    handler: SignalHandler
+    domain: str | None = None
+
+
+@dataclass
+class SignalFailure:
+    """派发给补偿处理器的故障上下文。
+
+    补偿处理器以此对象为唯一入参,避免与派发参数发生关键字冲突;
+    该对象同时挂载到原始异常的 ``__signal_failure__`` 属性上,
+    供异常上报链路观察。
+    """
+
+    exception: Exception
+    event: str
+    definition: str
+    domain: str | None
+    criticality: SignalCriticality
+    params: dict[str, Any]
+
+
+@dataclass
+class _DispatchEntry:
+    """一次派发中待执行的订阅者及其已解析策略。"""
+
+    signal: Signal
+    policy: SignalPolicy | None
+
+
+@dataclass
+class _DispatchFrame:
+    """一次派发的一致视图。
+
+    在派发开始时对订阅者列表(条件过滤后)与补偿登记表做快照,
+    派发期间的故障域状态只保存在帧上。嵌套派发各自持有独立的帧,
+    监听器动态替换不会影响正在进行的派发。
+    """
+
+    event: str
+    entries: list[_DispatchEntry]
+    compensations: dict[str, tuple[SignalCompensation, ...]]
+    failed_domains: set[str] = field(default_factory=set)
+
+    def compensations_for(self, entry: _DispatchEntry):
+        registered = self.compensations.get(entry.signal.ctx.definition, ())
+        domain = entry.policy.domain if entry.policy else None
+        return tuple(
+            compensation
+            for compensation in registered
+            if compensation.domain is None or compensation.domain == domain
+        )
+
+
 @dataclass
 class SignalWaiter:
     """项目内部接口说明。"""
@@ -133,6 +298,7 @@ class SignalRouter(BaseRouter):
         )
         self.allow_fail_builtin = True
         self.ctx.loop = None
+        self.ctx.compensations: dict[str, tuple[SignalCompensation, ...]] = {}
 
     @staticmethod
     def format_event(event: str | Enum) -> str:
@@ -181,6 +347,117 @@ class SignalRouter(BaseRouter):
 
         return group, [route.handler for route in group], params
 
+    def _resolve_entries(
+        self,
+        signals,
+        event: str,
+        condition: dict[str, str] | None,
+    ) -> list[_DispatchEntry]:
+        """按当前条件过滤订阅者并快照成本次派发的执行条目。"""
+        entries: list[_DispatchEntry] = []
+        for signal in signals:
+            requirements = signal.extra.requirements
+            if (
+                (condition is None and signal.ctx.exclusive is False)
+                or (condition is None and not requirements)
+                or (condition == requirements)
+            ) and (signal.ctx.trigger or event == signal.ctx.definition):
+                entries.append(
+                    _DispatchEntry(
+                        signal=signal,
+                        policy=getattr(signal.ctx, "policy", None),
+                    )
+                )
+        return entries
+
+    async def _report_failure(self, frame: _DispatchFrame, error: Exception):
+        """上报被隔离/被补偿的异常,使其可见但不再向外抛出。"""
+        if self.ctx.app.debug and self.ctx.app.state.verbosity >= 1:
+            error_logger.exception(error)
+
+        if frame.event != Event.SERVER_EXCEPTION_REPORT.value:
+            await self.dispatch(
+                Event.SERVER_EXCEPTION_REPORT.value,
+                context={"exception": error},
+            )
+            setattr(error, "__dispatched__", True)
+
+    async def _run_compensations(
+        self,
+        compensations: tuple[SignalCompensation, ...],
+        failure: SignalFailure,
+    ) -> list[Exception]:
+        """尽力执行全部补偿,收集补偿自身的失败而不中断后续补偿。"""
+        compensation_errors: list[Exception] = []
+        for compensation in compensations:
+            try:
+                maybe_coroutine = compensation.handler(failure)
+                if isawaitable(maybe_coroutine):
+                    await maybe_coroutine
+            except Exception as compensation_error:
+                error_logger.exception(
+                    "Compensation failed for signal event %s: %s",
+                    failure.event,
+                    compensation_error,
+                )
+                compensation_errors.append(compensation_error)
+        return compensation_errors
+
+    async def _handle_subscriber_failure(
+        self,
+        frame: _DispatchFrame,
+        entry: _DispatchEntry,
+        error: Exception,
+        params: dict[str, Any],
+    ) -> None:
+        """按订阅者声明的策略处理失败;需要立即失败时重新抛出原始异常。"""
+        policy = entry.policy
+        if policy is None or policy.on_failure is SignalFailureMode.PROPAGATE:
+            raise error
+
+        failure = SignalFailure(
+            exception=error,
+            event=frame.event,
+            definition=entry.signal.ctx.definition,
+            domain=policy.domain,
+            criticality=policy.criticality,
+            params=dict(params),
+        )
+        setattr(error, "__signal_failure__", failure)
+
+        if policy.on_failure is SignalFailureMode.COMPENSATE:
+            compensations = frame.compensations_for(entry)
+            if not compensations:
+                error_logger.warning(
+                    "Signal %s declared compensation but none is registered "
+                    "for event %s",
+                    failure.definition,
+                    failure.event,
+                )
+                raise error
+            compensation_errors = await self._run_compensations(
+                compensations, failure
+            )
+            if compensation_errors:
+                # 补偿失败不得掩盖最初原因:重新抛出原始异常,
+                # 补偿异常仅作为附注与属性保留
+                setattr(error, "__compensation_errors__", compensation_errors)
+                add_note = getattr(error, "add_note", None)
+                if add_note is not None:
+                    for compensation_error in compensation_errors:
+                        add_note(
+                            "Signal compensation failed: "
+                            f"{compensation_error!r}"
+                        )
+                raise error
+            await self._report_failure(frame, error)
+            return
+
+        # ISOLATE:把失败限制在故障域内,同域其余订阅者本次跳过
+        if policy.domain is not None:
+            frame.failed_domains.add(policy.domain)
+        await self._report_failure(frame, error)
+
     async def _dispatch(
         self,
         event: str,
@@ -208,32 +485,53 @@ class SignalRouter(BaseRouter):
         signals = group.routes
         if not reverse:
             signals = signals[::-1]
+
+        # 一次派发的一致视图:订阅者与补偿登记表在派发开始时快照,
+        # 之后的动态替换只影响后续派发
+        frame = _DispatchFrame(
+            event=event,
+            entries=self._resolve_entries(signals, event, condition),
+            compensations=self.ctx.compensations,
+        )
+
         try:
             for signal in signals:
-                for waiter in signal.ctx.waiters:
-                    if waiter.matches(event, condition):
+                for waiter in tuple(signal.ctx.waiters):
+                    if (
+                        waiter.future is not None
+                        and not waiter.future.done()
+                        and waiter.matches(event, condition)
+                    ):
                         waiter.future.set_result(dict(params))
 
-            for signal in signals:
-                requirements = signal.extra.requirements
+            for entry in frame.entries:
+                policy = entry.policy
                 if (
-                    (condition is None and signal.ctx.exclusive is False)
-                    or (condition is None and not requirements)
-                    or (condition == requirements)
-                ) and (signal.ctx.trigger or event == signal.ctx.definition):
-                    maybe_coroutine = signal.handler(**params)
+                    policy is not None
+                    and policy.domain is not None
+                    and policy.domain in frame.failed_domains
+                ):
+                    continue
+                try:
+                    maybe_coroutine = entry.signal.handler(**params)
                     if isawaitable(maybe_coroutine):
                         retval = await maybe_coroutine
                         if retval:
                             return retval
                     elif maybe_coroutine:
                         return maybe_coroutine
+                except Exception as e:
+                    await self._handle_subscriber_failure(
+                        frame, entry, e, params
+                    )
             return None
         except Exception as e:
             if self.ctx.app.debug and self.ctx.app.state.verbosity >= 1:
                 error_logger.exception(e)
 
-            if event != Event.SERVER_EXCEPTION_REPORT.value:
+            if event != Event.SERVER_EXCEPTION_REPORT.value and not getattr(
+                e, "__dispatched__", False
+            ):
                 await self.dispatch(
                     Event.SERVER_EXCEPTION_REPORT.value,
                     context={"exception": e},
@@ -314,24 +612,69 @@ class SignalRouter(BaseRouter):
         exclusive: bool = True,
         *,
         priority: int = 0,
+        order: int | None = None,
+        criticality: SignalCriticality | str | None = None,
+        domain: str | None = None,
+        on_failure: SignalFailureMode | str | None = None,
+        policy: SignalPolicy | None = None,
     ) -> Signal:
         event_definition = self.format_event(event)
         name, trigger, event_string = self._get_event_parts(event_definition)
+
+        if policy is not None and any(
+            declared is not None
+            for declared in (order, criticality, domain, on_failure)
+        ):
+            raise InvalidSignal(
+                "Cannot combine policy= with order/criticality/domain/"
+                "on_failure declarations"
+            )
+        if policy is None:
+            policy = SignalPolicy.build(
+                order=order,
+                criticality=criticality,
+                domain=domain,
+                on_failure=on_failure,
+            )
+            effective_priority = -order if order is not None else priority
+        else:
+            effective_priority = -policy.order if policy.order else priority
 
         signal = super().add(
             event_string,
             handler,
             name=name,
             append=True,
-            priority=priority,
+            priority=effective_priority,
         )  # type: ignore
 
         signal.ctx.exclusive = exclusive
         signal.ctx.trigger = trigger
         signal.ctx.definition = event_definition
+        signal.ctx.policy = policy
         signal.extra.requirements = condition
 
         return cast(Signal, signal)
+
+    def add_compensation(
+        self,
+        handler: SignalHandler,
+        event: str | Enum,
+        domain: str | None = None,
+    ) -> SignalCompensation:
+        """为事件登记补偿处理器。
+
+        登记表写时复制:正在进行的派发仍持有派发开始时的快照,
+        新登记的补偿只影响后续派发。
+        """
+        event_definition = self.format_event(event)
+        compensation = SignalCompensation(handler=handler, domain=domain)
+        registry = dict(self.ctx.compensations)
+        registry[event_definition] = registry.get(event_definition, ()) + (
+            compensation,
+        )
+        self.ctx.compensations = registry
+        return compensation
 
     def finalize(self, do_compile: bool = True, do_optimize: bool = False):
         """项目内部接口说明。"""

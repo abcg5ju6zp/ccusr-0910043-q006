@@ -76,6 +76,7 @@ from sanic.models.futures import (
     FutureRegistry,
     FutureRoute,
     FutureSignal,
+    FutureSignalCompensation,
 )
 from sanic.models.handler_types import ListenerType, MiddlewareType
 from sanic.models.handler_types import Sanic as SanicVar
@@ -83,7 +84,12 @@ from sanic.request import Request
 from sanic.response import BaseHTTPResponse, HTTPResponse, ResponseStream
 from sanic.router import Router
 from sanic.server.websockets.impl import ConnectionClosed
-from sanic.signals import Event, Signal, SignalRouter
+from sanic.signals import (
+    Event,
+    Signal,
+    SignalCompensation,
+    SignalRouter,
+)
 from sanic.touchup import TouchUp, TouchUpMeta
 from sanic.types.shared_ctx import SharedContext
 from sanic.worker.inspector import Inspector
@@ -135,6 +141,7 @@ class Sanic(
         "_future_middleware",
         "_future_registry",
         "_future_routes",
+        "_future_signal_compensations",
         "_future_signals",
         "_future_statics",
         "_inspector",
@@ -536,6 +543,17 @@ class Sanic(
                 condition=signal.condition,
                 exclusive=signal.exclusive,
                 priority=signal.priority,
+                policy=signal.policy,
+            )
+
+    def _apply_signal_compensation(
+        self, compensation: FutureSignalCompensation
+    ) -> SignalCompensation:
+        with self.amend():
+            return self.signal_router.add_compensation(
+                handler=compensation.handler,
+                event=compensation.event,
+                domain=compensation.domain,
             )
 
     @overload

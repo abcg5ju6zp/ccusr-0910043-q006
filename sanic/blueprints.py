@@ -73,6 +73,7 @@ class Blueprint(BaseSanic):
         "_future_middleware",
         "_future_listeners",
         "_future_exceptions",
+        "_future_signal_compensations",
         "_future_signals",
         "_allow_route_overwrite",
         "copied_from",
@@ -150,6 +151,7 @@ class Blueprint(BaseSanic):
     middleware = lazy(BaseSanic.middleware)
     route = lazy(BaseSanic.route)
     signal = lazy(BaseSanic.signal)
+    signal_compensation = lazy(BaseSanic.signal_compensation)
     static = lazy(BaseSanic.static, as_decorator=False)
 
     def reset(self) -> None:
@@ -391,8 +393,15 @@ class Blueprint(BaseSanic):
                     future.condition,
                     False,
                     future.priority,
+                    future.policy,
                 )
             )
+
+        # Signal compensations
+        for future in self._future_signal_compensations:
+            if (self, future) in app._future_registry:
+                continue
+            app._apply_signal_compensation(future)
 
         self.routes += [route for route in routes if isinstance(route, Route)]
         self.websocket_routes += [
@@ -412,6 +421,7 @@ class Blueprint(BaseSanic):
                     self._future_exceptions,
                     self._future_listeners,
                     self._future_signals,
+                    self._future_signal_compensations,
                 ),
             )
 
